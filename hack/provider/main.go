@@ -34,10 +34,10 @@ func main() {
 		panic(err)
 	}
 
-	replaced := strings.Replace(string(content), "##VERSION##", releaseVersion, -1)
+	replaced := strings.ReplaceAll(string(content), "##VERSION##", releaseVersion)
 
 	if buildVersion == "dev" {
-		replaced = strings.Replace(replaced, "##PROJECT_ROOT##", projectRoot, -1)
+		replaced = strings.ReplaceAll(replaced, "##PROJECT_ROOT##", projectRoot)
 	} else {
 		githubOwner, found := os.LookupEnv("GITHUB_OWNER")
 		if !found {
@@ -53,7 +53,7 @@ func main() {
 			panic(fmt.Errorf("generate checksum for %s: %v", k, err))
 		}
 
-		replaced = strings.Replace(replaced, v, checksum, -1)
+		replaced = strings.ReplaceAll(replaced, v, checksum)
 	}
 
 	fmt.Print(replaced)
@@ -65,7 +65,7 @@ func File(filePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	hash := sha256.New()
 	_, err = io.Copy(hash, file)
