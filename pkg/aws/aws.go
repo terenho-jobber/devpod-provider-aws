@@ -92,11 +92,14 @@ func NewProvider(ctx context.Context, withFolder bool, log log.Logger) (*AwsProv
 		config.RootDevice = "/dev/sda1"
 	}
 
+	accountID := getCallerAccount(ctx, cfg)
+
 	// create provider
 	provider := &AwsProvider{
 		Config:    config,
 		AwsConfig: cfg,
 		Log:       log,
+		accountID: accountID,
 	}
 
 	log.Debugf("AWS provider created successfully")
@@ -159,14 +162,16 @@ type AwsProvider struct {
 	AwsConfig        aws.Config
 	Log              log.Logger
 	WorkingDirectory string
+	accountID        string
 }
 
 func GetSubnet(ctx context.Context, provider *AwsProvider) (string, error) {
-	provider.Log.Debugf("getting subnet for VPC: %s, AvailabilityZone: %s", provider.Config.VpcID, provider.Config.AvailabilityZone)
+	provider.Log.Debugf("GetSubnet: vpc=%s az=%s subnets=%v",
+		provider.Config.VpcID, provider.Config.AvailabilityZone, provider.Config.SubnetIDs)
 
 	// in case a single subnet ID is specified, use it without further checks
 	if len(provider.Config.SubnetIDs) == 1 {
-		provider.Log.Debugf("using subnet: %s", provider.Config.SubnetIDs[0])
+		provider.Log.Infof("GetSubnet: using subnet %s", provider.Config.SubnetIDs[0])
 		return provider.Config.SubnetIDs[0], nil
 	}
 
@@ -268,14 +273,16 @@ func GetSubnet(ctx context.Context, provider *AwsProvider) (string, error) {
 
 func GetDevpodVPC(ctx context.Context, provider *AwsProvider) (string, error) {
 	if provider.Config.VpcID != "" {
+		provider.Log.Infof("GetDevpodVPC: using VPC %s", provider.Config.VpcID)
 		return provider.Config.VpcID, nil
 	}
+
 	// Get a list of VPCs so we can associate the group with the first VPC.
 	svc := ec2.NewFromConfig(provider.AwsConfig)
 
 	result, err := svc.DescribeVpcs(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("describe VPCs: %w", err)
 	}
 
 	if len(result.Vpcs) == 0 {
@@ -285,6 +292,7 @@ func GetDevpodVPC(ctx context.Context, provider *AwsProvider) (string, error) {
 	// We need to find a default vpc
 	for _, vpc := range result.Vpcs {
 		if *vpc.IsDefault {
+			provider.Log.Infof("GetDevpodVPC: using VPC %s", *vpc.VpcId)
 			return *vpc.VpcId, nil
 		}
 	}
@@ -372,6 +380,7 @@ func GetAMIRootDevice(ctx context.Context, cfg aws.Config, diskImage string) (st
 
 func GetDevpodInstanceProfile(ctx context.Context, provider *AwsProvider) (string, error) {
 	if provider.Config.InstanceProfileArn != "" {
+		provider.Log.Infof("GetDevpodInstanceProfile: using profile %s", provider.Config.InstanceProfileArn)
 		return provider.Config.InstanceProfileArn, nil
 	}
 
@@ -386,6 +395,7 @@ func GetDevpodInstanceProfile(ctx context.Context, provider *AwsProvider) (strin
 		return CreateDevpodInstanceProfile(ctx, provider)
 	}
 
+	provider.Log.Infof("GetDevpodInstanceProfile: using existing profile %s", *response.InstanceProfile.Arn)
 	return *response.InstanceProfile.Arn, nil
 }
 
@@ -445,7 +455,7 @@ func CreateDevpodInstanceProfile(ctx context.Context, provider *AwsProvider) (st
 
 	_, err = svc.PutRolePolicy(ctx, policyInput)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("put role policy: %w", err)
 	}
 
 	ssmManagedInstanceCorePolicyInput := &iam.AttachRolePolicyInput{
@@ -455,7 +465,7 @@ func CreateDevpodInstanceProfile(ctx context.Context, provider *AwsProvider) (st
 
 	_, err = svc.AttachRolePolicy(ctx, ssmManagedInstanceCorePolicyInput)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("attach SSM policy: %w", err)
 	}
 
 	if provider.Config.KmsKeyARNForSessionManager != "" {
@@ -479,7 +489,7 @@ func CreateDevpodInstanceProfile(ctx context.Context, provider *AwsProvider) (st
 
 		_, err = svc.PutRolePolicy(ctx, kmsDecryptPolicyInput)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("put KMS decrypt policy: %w", err)
 		}
 	}
 
@@ -515,7 +525,9 @@ func CreateDevpodInstanceProfile(ctx context.Context, provider *AwsProvider) (st
 
 func GetDevpodSecurityGroups(ctx context.Context, provider *AwsProvider) ([]string, error) {
 	if provider.Config.SecurityGroupID != "" {
-		return strings.Split(provider.Config.SecurityGroupID, ","), nil
+		sgs := strings.Split(provider.Config.SecurityGroupID, ",")
+		provider.Log.Infof("GetDevpodSecurityGroups: using configured groups %v", sgs)
+		return sgs, nil
 	}
 
 	svc := ec2.NewFromConfig(provider.AwsConfig)
@@ -547,6 +559,7 @@ func GetDevpodSecurityGroups(ctx context.Context, provider *AwsProvider) ([]stri
 			return nil, err
 		}
 
+		provider.Log.Infof("GetDevpodSecurityGroups: created new group %s", sg)
 		return []string{sg}, nil
 	}
 
@@ -555,6 +568,7 @@ func GetDevpodSecurityGroups(ctx context.Context, provider *AwsProvider) ([]stri
 		sgs = append(sgs, *result.SecurityGroups[res].GroupId)
 	}
 
+	provider.Log.Infof("GetDevpodSecurityGroups: using existing groups %v", sgs)
 	return sgs, nil
 }
 
@@ -817,23 +831,19 @@ func Create(
 	cfg aws.Config,
 	providerAws *AwsProvider,
 ) (Machine, error) {
-	providerAws.Log.Debugf("creating EC2 instance for machine: %s, type: %s, AMI: %s, disk: %dGB",
+	providerAws.Log.Debugf("Create: machine=%s type=%s ami=%s disk=%dGB",
 		providerAws.Config.MachineID,
 		providerAws.Config.MachineType,
 		providerAws.Config.DiskImage,
 		providerAws.Config.DiskSizeGB,
 	)
 
-	if err := logCallerIdentity(ctx, cfg, providerAws.Log); err != nil {
-		providerAws.Log.Warnf("failed to get caller identity: %v", err)
-	}
-
 	svc := ec2.NewFromConfig(cfg)
 
 	providerAws.Log.Debugf("getting security groups")
 	devpodSG, err := GetDevpodSecurityGroups(ctx, providerAws)
 	if err != nil {
-		return Machine{}, err
+		return Machine{}, fmt.Errorf("get security groups: %w", err)
 	}
 	providerAws.Log.Debugf("using security groups: %v", devpodSG)
 
@@ -917,16 +927,19 @@ func Create(
 		hostname := providerAws.Config.MachineID + "." + r53Zone.Name
 		providerAws.Log.Debugf("creating Route53 record: %s -> %s", hostname, *result.Instances[0].PrivateIpAddress)
 		if err := UpsertDevpodRoute53Record(ctx, providerAws, r53Zone.id, hostname, *result.Instances[0].PrivateIpAddress); err != nil {
-			return Machine{}, err
+			return Machine{}, fmt.Errorf("create Route53 record: %w", err)
 		}
 	}
 
-	providerAws.Log.Debugf("instance creation completed")
-	return NewMachineFromInstance(result.Instances[0]), nil
+	machine := NewMachineFromInstance(result.Instances[0])
+	providerAws.Log.Infof("Create: instance %s created", machine.InstanceID)
+	return machine, nil
 }
 
-func Start(ctx context.Context, cfg aws.Config, instanceID string) error {
-	svc := ec2.NewFromConfig(cfg)
+func Start(ctx context.Context, provider *AwsProvider, instanceID string) error {
+	provider.Log.Debugf("Start: instance=%s", instanceID)
+
+	svc := ec2.NewFromConfig(provider.AwsConfig)
 
 	input := &ec2.StartInstancesInput{
 		InstanceIds: []string{
@@ -936,14 +949,17 @@ func Start(ctx context.Context, cfg aws.Config, instanceID string) error {
 
 	_, err := svc.StartInstances(ctx, input)
 	if err != nil {
-		return err
+		return fmt.Errorf("start instance: %w", err)
 	}
 
-	return err
+	provider.Log.Infof("Start: instance %s started", instanceID)
+	return nil
 }
 
-func Stop(ctx context.Context, cfg aws.Config, instanceID string) error {
-	svc := ec2.NewFromConfig(cfg)
+func Stop(ctx context.Context, provider *AwsProvider, instanceID string) error {
+	provider.Log.Debugf("Stop: instance=%s", instanceID)
+
+	svc := ec2.NewFromConfig(provider.AwsConfig)
 
 	input := &ec2.StopInstancesInput{
 		InstanceIds: []string{
@@ -953,36 +969,47 @@ func Stop(ctx context.Context, cfg aws.Config, instanceID string) error {
 
 	_, err := svc.StopInstances(ctx, input)
 	if err != nil {
-		return err
+		return fmt.Errorf("stop instance: %w", err)
 	}
 
-	return err
+	provider.Log.Infof("Stop: instance %s stopped", instanceID)
+	return nil
 }
 
-func Status(ctx context.Context, cfg aws.Config, name string) (client.Status, error) {
-	result, err := GetDevpodInstance(ctx, cfg, name)
+func Status(ctx context.Context, provider *AwsProvider, name string) (client.Status, error) {
+	provider.Log.Debugf("Status: machine=%s", name)
+
+	result, err := GetDevpodInstance(ctx, provider.AwsConfig, name)
 	if err != nil {
-		return client.StatusNotFound, err
+		return client.StatusNotFound, fmt.Errorf("get instance: %w", err)
 	}
 
 	if result.Status == "" {
+		provider.Log.Infof("Status: machine %s not found", name)
 		return client.StatusNotFound, nil
 	}
 
 	status := result.Status
+	var clientStatus client.Status
 	switch status {
 	case "running":
-		return client.StatusRunning, nil
+		clientStatus = client.StatusRunning
 	case "stopped":
-		return client.StatusStopped, nil
+		clientStatus = client.StatusStopped
 	case "terminated":
+		provider.Log.Infof("Status: machine %s terminated", name)
 		return client.StatusNotFound, nil
 	default:
-		return client.StatusBusy, nil
+		clientStatus = client.StatusBusy
 	}
+
+	provider.Log.Infof("Status: machine %s is %s", name, status)
+	return clientStatus, nil
 }
 
 func Delete(ctx context.Context, provider *AwsProvider, machine Machine) error {
+	provider.Log.Debugf("Delete: instance=%s", machine.InstanceID)
+
 	svc := ec2.NewFromConfig(provider.AwsConfig)
 
 	input := &ec2.TerminateInstancesInput{
@@ -993,7 +1020,7 @@ func Delete(ctx context.Context, provider *AwsProvider, machine Machine) error {
 
 	_, err := svc.TerminateInstances(ctx, input)
 	if err != nil {
-		return err
+		return fmt.Errorf("terminate instance: %w", err)
 	}
 
 	if machine.SpotInstanceRequestId != "" {
@@ -1003,22 +1030,23 @@ func Delete(ctx context.Context, provider *AwsProvider, machine Machine) error {
 			},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("cancel spot request: %w", err)
 		}
 	}
 
 	if provider.Config.UseRoute53Hostnames {
 		r53Zone, err := GetDevpodRoute53Zone(ctx, provider)
 		if err != nil {
-			return err
+			return fmt.Errorf("get Route53 zone: %w", err)
 		}
 		if r53Zone.id != "" {
 			if err := DeleteDevpodRoute53Record(ctx, provider, r53Zone, machine); err != nil {
-				return err
+				return fmt.Errorf("delete Route53 record: %w", err)
 			}
 		}
 	}
 
+	provider.Log.Infof("Delete: instance %s terminated", machine.InstanceID)
 	return nil
 }
 
@@ -1058,9 +1086,19 @@ func logCallerIdentity(ctx context.Context, cfg aws.Config, logs log.Logger) err
 		return err
 	}
 
-	logs.Debugf("AWS Caller Identity Account: %s, ARN: %s, UserID: %s",
+	logs.Infof("AWS Provider initialized - Account: %s, Region: %s, ARN: %s",
 		aws.ToString(result.Account),
-		aws.ToString(result.Arn),
-		aws.ToString(result.UserId))
+		cfg.Region,
+		aws.ToString(result.Arn))
 	return nil
+}
+
+// getCallerAccount returns the AWS account ID for logging context
+func getCallerAccount(ctx context.Context, cfg aws.Config) string {
+	svc := sts.NewFromConfig(cfg)
+	result, err := svc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "unknown"
+	}
+	return aws.ToString(result.Account)
 }
