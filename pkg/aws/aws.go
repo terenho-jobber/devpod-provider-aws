@@ -981,6 +981,12 @@ func Create(
 		TagSpecifications: GetInstanceTags(providerAws, r53Zone),
 		UserData:          &userData,
 	}
+	if providerAws.Config.UseNestedVirtualization {
+		providerAws.Log.Debugf("enabling nested virtualization")
+		instance.CpuOptions = &types.CpuOptionsRequest{
+			NestedVirtualization: types.NestedVirtualizationSpecificationEnabled,
+		}
+	}
 	if providerAws.Config.UseSpotInstance {
 		providerAws.Log.Debugf("using spot instance")
 		instance.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
