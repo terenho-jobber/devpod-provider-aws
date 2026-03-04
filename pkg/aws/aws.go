@@ -988,13 +988,16 @@ func Create(
 		}
 	}
 	if providerAws.Config.UseSpotInstance {
-		providerAws.Log.Debugf("using spot instance")
+		providerAws.Log.Debugf("using spot instance (type: %s)", providerAws.Config.SpotInstanceType)
+		spotOpts := &types.SpotMarketOptions{
+			SpotInstanceType: types.SpotInstanceType(providerAws.Config.SpotInstanceType),
+		}
+		if providerAws.Config.SpotInstanceType == "persistent" {
+			spotOpts.InstanceInterruptionBehavior = "stop"
+		}
 		instance.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
-			MarketType: "spot",
-			SpotOptions: &types.SpotMarketOptions{
-				SpotInstanceType:             "persistent",
-				InstanceInterruptionBehavior: "stop",
-			},
+			MarketType:  "spot",
+			SpotOptions: spotOpts,
 		}
 	}
 

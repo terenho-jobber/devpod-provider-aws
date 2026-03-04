@@ -159,7 +159,7 @@ func buildOptionGroups() []OptionGroup {
 				"AWS_AMI", "AWS_DISK_SIZE", "AWS_ROOT_DEVICE", "AWS_INSTANCE_TYPE",
 				"AWS_VPC_ID", "AWS_SUBNET_ID", "AWS_SECURITY_GROUP_ID", "AWS_INSTANCE_PROFILE_ARN",
 				"AWS_INSTANCE_TAGS", "AWS_USE_INSTANCE_CONNECT_ENDPOINT", "AWS_INSTANCE_CONNECT_ENDPOINT_ID",
-				"AWS_USE_SPOT_INSTANCE", "AWS_USE_SESSION_MANAGER", "AWS_KMS_KEY_ARN_FOR_SESSION_MANAGER",
+				"AWS_USE_SPOT_INSTANCE", "AWS_SPOT_INSTANCE_TYPE", "AWS_USE_SESSION_MANAGER", "AWS_KMS_KEY_ARN_FOR_SESSION_MANAGER",
 				"AWS_USE_ROUTE53", "AWS_ROUTE53_ZONE_NAME", "AWS_AVAILABILITY_ZONE", "AWS_USE_NESTED_VIRTUALIZATION",
 			},
 		},
@@ -286,6 +286,11 @@ func buildOptions() Options {
 			Description: "Prefer the Spot instead of On-Demand instances.",
 			Type:        "boolean",
 			Default:     "false",
+		},
+		"AWS_SPOT_INSTANCE_TYPE": {
+			Description: "The spot instance request type. Use 'persistent' to keep the request active after interruption, or 'one-time' for a single fulfillment attempt. Only used when AWS_USE_SPOT_INSTANCE is true.",
+			Default:     "persistent",
+			Suggestions: []string{"persistent", "one-time"},
 		},
 		"AWS_USE_SESSION_MANAGER": {
 			Description: "If defined, will try to connect to the ec2 instance via the AWS Session Manager",

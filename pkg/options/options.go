@@ -23,6 +23,7 @@ var (
 	AWS_USE_INSTANCE_CONNECT_ENDPOINT   = "AWS_USE_INSTANCE_CONNECT_ENDPOINT"
 	AWS_INSTANCE_CONNECT_ENDPOINT_ID    = "AWS_INSTANCE_CONNECT_ENDPOINT_ID"
 	AWS_USE_SPOT_INSTANCE               = "AWS_USE_SPOT_INSTANCE"
+	AWS_SPOT_INSTANCE_TYPE              = "AWS_SPOT_INSTANCE_TYPE"
 	AWS_USE_SESSION_MANAGER             = "AWS_USE_SESSION_MANAGER"
 	AWS_KMS_KEY_ARN_FOR_SESSION_MANAGER = "AWS_KMS_KEY_ARN_FOR_SESSION_MANAGER"
 	AWS_USE_ROUTE53                     = "AWS_USE_ROUTE53"
@@ -51,6 +52,7 @@ type Options struct {
 	UseInstanceConnectEndpoint bool
 	InstanceConnectEndpointID  string
 	UseSpotInstance            bool
+	SpotInstanceType           string
 	UseSessionManager          bool
 	KmsKeyARNForSessionManager string
 	UseRoute53Hostnames        bool
@@ -96,6 +98,10 @@ func FromEnv(init, withFolder bool) (*Options, error) {
 	retOptions.UseInstanceConnectEndpoint = os.Getenv(AWS_USE_INSTANCE_CONNECT_ENDPOINT) == strTrue
 	retOptions.InstanceConnectEndpointID = os.Getenv(AWS_INSTANCE_CONNECT_ENDPOINT_ID)
 	retOptions.UseSpotInstance = os.Getenv(AWS_USE_SPOT_INSTANCE) == strTrue
+	retOptions.SpotInstanceType = os.Getenv(AWS_SPOT_INSTANCE_TYPE)
+	if retOptions.SpotInstanceType == "" {
+		retOptions.SpotInstanceType = "persistent"
+	}
 	retOptions.UseSessionManager = os.Getenv(AWS_USE_SESSION_MANAGER) == strTrue
 	retOptions.KmsKeyARNForSessionManager = os.Getenv(AWS_KMS_KEY_ARN_FOR_SESSION_MANAGER)
 	retOptions.UseRoute53Hostnames = os.Getenv(AWS_USE_ROUTE53) == strTrue
