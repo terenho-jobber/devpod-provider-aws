@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,6 +32,7 @@ import (
 )
 
 const (
+	tagKeyDevpod               = "devpod"
 	tagKeyHostname             = "devpod:hostname"
 	devpodIAMResourceName      = "devpod-ec2-role"
 	iamEC2PolicyName           = "devpod-ec2-policy"
@@ -40,7 +42,9 @@ const (
 // ErrInstanceNotFound is returned when no matching EC2 instance exists.
 var ErrInstanceNotFound = errors.New("instance not found")
 
-// detect if we're in an ec2 instance
+const defaultRootDevice = "/dev/sda1"
+
+// detect if we're in an ec2 instance.
 func isEC2Instance(ctx context.Context) bool {
 	httpClient := &http.Client{Timeout: 1 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, "GET", "http://instance-data.ec2.internal", nil)
@@ -54,39 +58,6 @@ func isEC2Instance(ctx context.Context) bool {
 	defer func() { _ = resp.Body.Close() }()
 
 	return true
-}
-
-func NewProvider(ctx context.Context, withFolder bool, log log.Logger) (*AwsProvider, error) {
-	log.Debugf("creating new AWS provider")
-	config, err := options.FromEnv(false, withFolder)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg, err := NewAWSConfig(ctx, log, config)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := logCallerIdentity(ctx, cfg, log); err != nil {
-		log.Warnf("failed to get caller identity: %v", err)
-	}
-
-	if err := configureDefaults(ctx, cfg, config, log); err != nil {
-		return nil, err
-	}
-
-	accountID := getCallerAccount(ctx, cfg)
-
-	provider := &AwsProvider{
-		Config:    config,
-		AwsConfig: cfg,
-		Log:       log,
-		accountID: accountID,
-	}
-
-	log.Debugf("AWS provider created")
-	return provider, nil
 }
 
 func configureDefaults(
@@ -109,7 +80,7 @@ func configureDefaults(
 	}
 
 	if config.RootDevice == "" {
-		config.RootDevice = "/dev/sda1"
+		config.RootDevice = defaultRootDevice
 	}
 
 	return nil
@@ -139,11 +110,12 @@ func setRootDevice(ctx context.Context, cfg aws.Config, config *options.Options,
 	device, err := GetAMIRootDevice(ctx, cfg, config.DiskImage)
 	if err != nil {
 		log.Debugf(
-			"could not determine root device for AMI %s: %v, using default /dev/sda1",
+			"could not determine root device for AMI %s: %v, using default %s",
 			config.DiskImage,
 			err,
+			defaultRootDevice,
 		)
-		config.RootDevice = "/dev/sda1"
+		config.RootDevice = defaultRootDevice
 	} else {
 		log.Debugf("using root device: %s", device)
 		config.RootDevice = device
@@ -156,7 +128,10 @@ func NewAWSConfig(
 	options *options.Options,
 ) (aws.Config, error) {
 	log.Debugf("configuring AWS SDK for region %s", options.Zone)
-	opts := buildConfigOptions(ctx, log, options)
+	opts, err := buildConfigOptions(ctx, log, options)
+	if err != nil {
+		return aws.Config{}, err
+	}
 	cfg, err := awsConfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return aws.Config{}, err
@@ -169,14 +144,15 @@ func buildConfigOptions(
 	ctx context.Context,
 	log log.Logger,
 	options *options.Options,
-) []func(*awsConfig.LoadOptions) error {
+) ([]func(*awsConfig.LoadOptions) error, error) {
 	var opts []func(*awsConfig.LoadOptions) error
 
 	if options.Zone != "" {
 		opts = append(opts, awsConfig.WithRegion(options.Zone))
 	}
 
-	if options.AccessKeyID != "" && options.SecretAccessKey != "" {
+	switch {
+	case options.AccessKeyID != "" && options.SecretAccessKey != "":
 		log.Debugf("using provided AWS credentials")
 		opts = append(opts, awsConfig.WithCredentialsProvider(credentials.StaticCredentialsProvider{
 			Value: aws.Credentials{
@@ -185,16 +161,16 @@ func buildConfigOptions(
 				SessionToken:    options.SessionToken,
 			},
 		}))
-	} else if options.CustomCredentialCommand != "" {
+	case options.CustomCredentialCommand != "":
 		creds, err := executeCredentialCommand(ctx, options.CustomCredentialCommand, log)
 		if err != nil {
-			log.Errorf("custom credential command failed: %v", err)
+			return nil, fmt.Errorf("custom credential command: %w", err)
 		}
 		opts = append(
 			opts,
 			awsConfig.WithCredentialsProvider(credentials.StaticCredentialsProvider{Value: creds}),
 		)
-	} else {
+	default:
 		profile := os.Getenv("AWS_PROFILE")
 		if profile != "" {
 			log.Debugf("using AWS profile %s", profile)
@@ -203,7 +179,7 @@ func buildConfigOptions(
 		}
 	}
 
-	return opts
+	return opts, nil
 }
 
 func executeCredentialCommand(
@@ -248,13 +224,51 @@ type AwsProvider struct {
 	accountID        string
 }
 
-func GetSubnet(ctx context.Context, provider *AwsProvider) (string, error) {
+func NewProvider(ctx context.Context, withFolder bool, log log.Logger) (*AwsProvider, error) {
+	log.Debugf("creating new AWS provider")
+	config, err := options.FromEnv(false, withFolder)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := NewAWSConfig(ctx, log, config)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := logCallerIdentity(ctx, cfg, log); err != nil {
+		log.Warnf("failed to get caller identity: %v", err)
+	}
+
+	if err := configureDefaults(ctx, cfg, config, log); err != nil {
+		return nil, err
+	}
+
+	accountID := getCallerAccount(ctx, cfg)
+
+	provider := &AwsProvider{
+		Config:    config,
+		AwsConfig: cfg,
+		Log:       log,
+		accountID: accountID,
+	}
+
+	log.Debugf("AWS provider created")
+	return provider, nil
+}
+
+// subnetResult holds the resolved subnet ID and its VPC ID.
+type subnetResult struct {
+	subnetID string
+	vpcID    string
+}
+
+func GetSubnet(ctx context.Context, provider *AwsProvider) (subnetResult, error) {
 	provider.Log.Debugf("getting subnet: vpc=%s az=%s subnets=%v",
 		provider.Config.VpcID, provider.Config.AvailabilityZone, provider.Config.SubnetIDs)
 
 	if len(provider.Config.SubnetIDs) == 1 {
-		provider.Log.Debugf("using configured subnet %s", provider.Config.SubnetIDs[0])
-		return provider.Config.SubnetIDs[0], nil
+		return describeSubnetResult(ctx, provider, provider.Config.SubnetIDs[0])
 	}
 
 	if len(provider.Config.SubnetIDs) > 1 {
@@ -264,7 +278,7 @@ func GetSubnet(ctx context.Context, provider *AwsProvider) (string, error) {
 	return discoverSubnet(ctx, provider)
 }
 
-func selectFromSpecifiedSubnets(ctx context.Context, provider *AwsProvider) (string, error) {
+func selectFromSpecifiedSubnets(ctx context.Context, provider *AwsProvider) (subnetResult, error) {
 	subnetIDs := provider.Config.SubnetIDs
 	az := provider.Config.AvailabilityZone
 	provider.Log.Debugf("selecting subnet from %d specified subnets", len(subnetIDs))
@@ -272,18 +286,22 @@ func selectFromSpecifiedSubnets(ctx context.Context, provider *AwsProvider) (str
 	svc := ec2.NewFromConfig(provider.AwsConfig)
 	subnets, err := svc.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: subnetIDs})
 	if err != nil {
-		return "", fmt.Errorf("list specified subnets %q: %w", subnetIDs, err)
+		return subnetResult{}, fmt.Errorf("list specified subnets %q: %w", subnetIDs, err)
 	}
 	if len(subnets.Subnets) == 0 {
-		return "", fmt.Errorf("no subnets found with IDs %q", subnetIDs)
+		return subnetResult{}, fmt.Errorf("no subnets found with IDs %q", subnetIDs)
 	}
 
 	subnet := selectSubnetWithMostIPs(subnets.Subnets, az)
 	if subnet == nil {
 		if az == "" {
-			return "", fmt.Errorf("no subnets found with IDs %q", subnetIDs)
+			return subnetResult{}, fmt.Errorf("no subnets found with IDs %q", subnetIDs)
 		}
-		return "", fmt.Errorf("no subnets found with IDs %q in availability zone %q", subnetIDs, az)
+		return subnetResult{}, fmt.Errorf(
+			"no subnets found with IDs %q in availability zone %q",
+			subnetIDs,
+			az,
+		)
 	}
 
 	provider.Log.Debugf(
@@ -291,7 +309,7 @@ func selectFromSpecifiedSubnets(ctx context.Context, provider *AwsProvider) (str
 		*subnet.SubnetId,
 		*subnet.AvailableIpAddressCount,
 	)
-	return *subnet.SubnetId, nil
+	return subnetResultFrom(subnet), nil
 }
 
 func selectSubnetWithMostIPs(subnets []types.Subnet, az string) *types.Subnet {
@@ -315,7 +333,34 @@ func selectSubnetWithMostIPs(subnets []types.Subnet, az string) *types.Subnet {
 	return selected
 }
 
-func discoverSubnet(ctx context.Context, provider *AwsProvider) (string, error) {
+func describeSubnetResult(
+	ctx context.Context,
+	provider *AwsProvider,
+	subnetID string,
+) (subnetResult, error) {
+	svc := ec2.NewFromConfig(provider.AwsConfig)
+	out, err := svc.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
+		SubnetIds: []string{subnetID},
+	})
+	if err != nil {
+		return subnetResult{}, fmt.Errorf("describe subnet %s: %w", subnetID, err)
+	}
+	if len(out.Subnets) == 0 {
+		return subnetResult{}, fmt.Errorf("subnet %s not found", subnetID)
+	}
+	provider.Log.Debugf("using configured subnet %s (vpc: %s)", subnetID, *out.Subnets[0].VpcId)
+	return subnetResultFrom(&out.Subnets[0]), nil
+}
+
+func subnetResultFrom(s *types.Subnet) subnetResult {
+	r := subnetResult{subnetID: *s.SubnetId}
+	if s.VpcId != nil {
+		r.vpcID = *s.VpcId
+	}
+	return r
+}
+
+func discoverSubnet(ctx context.Context, provider *AwsProvider) (subnetResult, error) {
 	vpcID := provider.Config.VpcID
 	az := provider.Config.AvailabilityZone
 	provider.Log.Debugf("searching for suitable subnet")
@@ -323,16 +368,16 @@ func discoverSubnet(ctx context.Context, provider *AwsProvider) (string, error) 
 	svc := ec2.NewFromConfig(provider.AwsConfig)
 	subnets, err := listAllSubnets(ctx, svc, az)
 	if err != nil {
-		return "", err
+		return subnetResult{}, err
 	}
 
-	if subnet := findTaggedDevPodSubnet(subnets); subnet != nil {
+	if subnet := findTaggedDevPodSubnet(filterByVPC(subnets, vpcID)); subnet != nil {
 		provider.Log.Debugf(
 			"found tagged subnet %s with %d available IPs",
 			*subnet.SubnetId,
 			*subnet.AvailableIpAddressCount,
 		)
-		return *subnet.SubnetId, nil
+		return subnetResultFrom(subnet), nil
 	}
 
 	if subnet := findVPCPublicSubnet(subnets, vpcID); subnet != nil {
@@ -341,17 +386,17 @@ func discoverSubnet(ctx context.Context, provider *AwsProvider) (string, error) 
 			*subnet.SubnetId,
 			*subnet.AvailableIpAddressCount,
 		)
-		return *subnet.SubnetId, nil
+		return subnetResultFrom(subnet), nil
 	}
 
 	if vpcID == "" {
-		return "", fmt.Errorf(
+		return subnetResult{}, fmt.Errorf(
 			"could not find a suitable subnet. Please either specify a subnet ID or VPC ID, or tag the desired" +
 				" subnets with devpod=devpod",
 		)
 	}
 
-	return "", fmt.Errorf(
+	return subnetResult{}, fmt.Errorf(
 		"no suitable subnet found in VPC %q. Please specify a subnet ID or tag subnets with devpod=devpod",
 		vpcID,
 	)
@@ -377,28 +422,42 @@ func listAllSubnets(ctx context.Context, svc *ec2.Client, az string) ([]types.Su
 	return subnets, nil
 }
 
+func filterByVPC(subnets []types.Subnet, vpcID string) []types.Subnet {
+	if vpcID == "" {
+		return subnets
+	}
+	var filtered []types.Subnet
+	for _, s := range subnets {
+		if s.VpcId != nil && *s.VpcId == vpcID {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
+}
+
 func findTaggedDevPodSubnet(subnets []types.Subnet) *types.Subnet {
 	var maxIPCount int32 = -1
 	var selected *types.Subnet
 	for i := range subnets {
-		s := subnets[i]
-		if s.AvailableIpAddressCount == nil {
+		if subnets[i].AvailableIpAddressCount == nil {
 			continue
 		}
-		for _, tag := range s.Tags {
-			if tag.Key == nil || tag.Value == nil {
-				continue
-			}
-			if *tag.Key == "devpod" && *tag.Value == "devpod" {
-				if selected == nil || *s.AvailableIpAddressCount > maxIPCount {
-					maxIPCount = *s.AvailableIpAddressCount
-					selected = &subnets[i]
-				}
-				break
-			}
+		if isDevpodTagged(subnets[i].Tags) && *subnets[i].AvailableIpAddressCount > maxIPCount {
+			maxIPCount = *subnets[i].AvailableIpAddressCount
+			selected = &subnets[i]
 		}
 	}
 	return selected
+}
+
+func isDevpodTagged(tags []types.Tag) bool {
+	for _, tag := range tags {
+		if tag.Key != nil && tag.Value != nil &&
+			*tag.Key == tagKeyDevpod && *tag.Value == tagKeyDevpod {
+			return true
+		}
+	}
+	return false
 }
 
 func findVPCPublicSubnet(subnets []types.Subnet, vpcID string) *types.Subnet {
@@ -409,15 +468,18 @@ func findVPCPublicSubnet(subnets []types.Subnet, vpcID string) *types.Subnet {
 	var selected *types.Subnet
 	for i := range subnets {
 		s := &subnets[i]
-		if s.VpcId == nil || s.MapPublicIpOnLaunch == nil || s.AvailableIpAddressCount == nil {
-			continue
-		}
-		if *s.VpcId == vpcID && *s.MapPublicIpOnLaunch && *s.AvailableIpAddressCount > maxIPCount {
+		if isPublicSubnetInVPC(s, vpcID) && *s.AvailableIpAddressCount > maxIPCount {
 			maxIPCount = *s.AvailableIpAddressCount
 			selected = s
 		}
 	}
 	return selected
+}
+
+func isPublicSubnetInVPC(s *types.Subnet, vpcID string) bool {
+	return s.VpcId != nil && s.MapPublicIpOnLaunch != nil &&
+		s.AvailableIpAddressCount != nil &&
+		*s.VpcId == vpcID && *s.MapPublicIpOnLaunch
 }
 
 func GetDevpodVPC(ctx context.Context, provider *AwsProvider) (string, error) {
@@ -521,7 +583,7 @@ func GetAMIRootDevice(ctx context.Context, cfg aws.Config, diskImage string) (st
 
 	// Struct spec: https://docs.aws.amazon.com/sdk-for-go/api/service/ec2/#Image
 	if len(result.Images) == 0 || *result.Images[0].RootDeviceName == "" {
-		return "/dev/sda1", nil
+		return defaultRootDevice, nil
 	}
 
 	return *result.Images[0].RootDeviceName, nil
@@ -688,7 +750,11 @@ func waitForInstanceProfile(ctx context.Context, svc *iam.Client) error {
 	return nil
 }
 
-func GetDevpodSecurityGroups(ctx context.Context, provider *AwsProvider) ([]string, error) {
+func GetDevpodSecurityGroups(
+	ctx context.Context,
+	provider *AwsProvider,
+	vpcID string,
+) ([]string, error) {
 	if provider.Config.SecurityGroupID != "" {
 		sgs := strings.Split(provider.Config.SecurityGroupID, ",")
 		provider.Log.Debugf("using configured security groups %v", sgs)
@@ -701,25 +767,26 @@ func GetDevpodSecurityGroups(ctx context.Context, provider *AwsProvider) ([]stri
 			{
 				Name: aws.String("tag:devpod"),
 				Values: []string{
-					"devpod",
+					tagKeyDevpod,
 				},
 			},
 		},
 	}
 
-	if provider.Config.VpcID != "" {
+	if vpcID != "" {
 		input.Filters = append(input.Filters, types.Filter{
-			Name: aws.String("vpc-id"),
-			Values: []string{
-				provider.Config.VpcID,
-			},
+			Name:   aws.String("vpc-id"),
+			Values: []string{vpcID},
 		})
 	}
 
 	result, err := svc.DescribeSecurityGroups(ctx, input)
-	// It it is not created, do it
-	if result == nil || len(result.SecurityGroups) == 0 || err != nil {
-		sg, err := CreateDevpodSecurityGroup(ctx, provider)
+	if err != nil {
+		return nil, fmt.Errorf("describe security groups: %w", err)
+	}
+
+	if len(result.SecurityGroups) == 0 {
+		sg, err := CreateDevpodSecurityGroup(ctx, provider, vpcID)
 		if err != nil {
 			return nil, err
 		}
@@ -737,14 +804,19 @@ func GetDevpodSecurityGroups(ctx context.Context, provider *AwsProvider) ([]stri
 	return sgs, nil
 }
 
-func CreateDevpodSecurityGroup(ctx context.Context, provider *AwsProvider) (string, error) {
-	var err error
-
+func CreateDevpodSecurityGroup(
+	ctx context.Context,
+	provider *AwsProvider,
+	vpcID string,
+) (string, error) {
 	svc := ec2.NewFromConfig(provider.AwsConfig)
 
-	vpc, err := GetDevpodVPC(ctx, provider)
-	if err != nil {
-		return "", err
+	if vpcID == "" {
+		var err error
+		vpcID, err = GetDevpodVPC(ctx, provider)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Create the security group with the VPC, name, and description.
@@ -756,13 +828,13 @@ func CreateDevpodSecurityGroup(ctx context.Context, provider *AwsProvider) (stri
 				ResourceType: "security-group",
 				Tags: []types.Tag{
 					{
-						Key:   aws.String("devpod"),
-						Value: aws.String("devpod"),
+						Key:   aws.String(tagKeyDevpod),
+						Value: aws.String(tagKeyDevpod),
 					},
 				},
 			},
 		},
-		VpcId: aws.String(vpc),
+		VpcId: aws.String(vpcID),
 	})
 	if err != nil {
 		return "", err
@@ -775,8 +847,20 @@ func CreateDevpodSecurityGroup(ctx context.Context, provider *AwsProvider) (stri
 		return groupID, nil
 	}
 
-	// Add permissions to the security group
-	_, err = svc.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+	if err := authorizeSSHIngress(ctx, svc, groupID); err != nil {
+		if _, delErr := svc.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
+			GroupId: aws.String(groupID),
+		}); delErr != nil {
+			provider.Log.Warnf("failed to clean up security group %s: %v", groupID, delErr)
+		}
+		return "", err
+	}
+
+	return groupID, nil
+}
+
+func authorizeSSHIngress(ctx context.Context, svc *ec2.Client, groupID string) error {
+	_, err := svc.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(groupID),
 		IpPermissions: []types.IpPermission{
 			{
@@ -795,18 +879,14 @@ func CreateDevpodSecurityGroup(ctx context.Context, provider *AwsProvider) (stri
 				ResourceType: "security-group-rule",
 				Tags: []types.Tag{
 					{
-						Key:   aws.String("devpod"),
+						Key:   aws.String(tagKeyDevpod),
 						Value: aws.String("devpod-ingress"),
 					},
 				},
 			},
 		},
 	})
-	if err != nil {
-		return "", err
-	}
-
-	return groupID, nil
+	return err
 }
 
 func anyState() []string {
@@ -908,7 +988,7 @@ func GetInstanceTags(providerAws *AwsProvider, zone route53Zone) []types.TagSpec
 func buildBaseTags(machineID string, zone route53Zone) []types.Tag {
 	tags := []types.Tag{
 		{Key: aws.String("Name"), Value: aws.String(machineID)},
-		{Key: aws.String("devpod"), Value: aws.String(machineID)},
+		{Key: aws.String(tagKeyDevpod), Value: aws.String(machineID)},
 	}
 
 	if zone.id != "" {
@@ -957,95 +1037,12 @@ func Create(
 		providerAws.Config.DiskSizeGB,
 	)
 
-	svc := ec2.NewFromConfig(cfg)
-
-	providerAws.Log.Debugf("getting security groups")
-	devpodSG, err := GetDevpodSecurityGroups(ctx, providerAws)
-	if err != nil {
-		return Machine{}, fmt.Errorf("get security groups: %w", err)
-	}
-	providerAws.Log.Debugf("using security groups: %v", devpodSG)
-
-	volSizeI32 := int32(providerAws.Config.DiskSizeGB)
-
-	providerAws.Log.Debugf("generating user data script")
-	userData, err := GetInjectKeypairScript(providerAws.Config.MachineFolder)
+	instance, r53Zone, err := buildRunInstancesInput(ctx, providerAws)
 	if err != nil {
 		return Machine{}, err
 	}
 
-	var r53Zone route53Zone
-	if providerAws.Config.UseRoute53Hostnames {
-		providerAws.Log.Debugf("Route53 hostnames enabled, getting zone")
-		r53Zone, err = GetDevpodRoute53Zone(ctx, providerAws)
-		if err != nil {
-			return Machine{}, err
-		}
-		providerAws.Log.Debugf("using Route53 zone %s (id: %s)", r53Zone.Name, r53Zone.id)
-	}
-
-	instance := &ec2.RunInstancesInput{
-		ImageId:          aws.String(providerAws.Config.DiskImage),
-		InstanceType:     types.InstanceType(providerAws.Config.MachineType),
-		MinCount:         aws.Int32(1),
-		MaxCount:         aws.Int32(1),
-		SecurityGroupIds: devpodSG,
-		MetadataOptions: &types.InstanceMetadataOptionsRequest{
-			HttpEndpoint:            types.InstanceMetadataEndpointStateEnabled,
-			HttpTokens:              types.HttpTokensStateRequired,
-			HttpPutResponseHopLimit: aws.Int32(1),
-		},
-		BlockDeviceMappings: []types.BlockDeviceMapping{
-			{
-				DeviceName: aws.String(providerAws.Config.RootDevice),
-				Ebs: &types.EbsBlockDevice{
-					VolumeSize: &volSizeI32,
-				},
-			},
-		},
-		TagSpecifications: GetInstanceTags(providerAws, r53Zone),
-		UserData:          &userData,
-	}
-	if providerAws.Config.UseNestedVirtualization {
-		providerAws.Log.Debugf("enabling nested virtualization")
-		instance.CpuOptions = &types.CpuOptionsRequest{
-			NestedVirtualization: types.NestedVirtualizationSpecificationEnabled,
-		}
-	}
-	if providerAws.Config.UseSpotInstance {
-		providerAws.Log.Debugf(
-			"using spot instance (type: %s)",
-			providerAws.Config.SpotInstanceType,
-		)
-		spotOpts := &types.SpotMarketOptions{
-			SpotInstanceType: types.SpotInstanceType(providerAws.Config.SpotInstanceType),
-		}
-		if providerAws.Config.SpotInstanceType == "persistent" {
-			spotOpts.InstanceInterruptionBehavior = "stop"
-		}
-		instance.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
-			MarketType:  "spot",
-			SpotOptions: spotOpts,
-		}
-	}
-
-	providerAws.Log.Debugf("getting instance profile")
-	profile, err := GetDevpodInstanceProfile(ctx, providerAws)
-	if err == nil {
-		providerAws.Log.Debugf("using instance profile: %s", profile)
-		instance.IamInstanceProfile = &types.IamInstanceProfileSpecification{
-			Arn: aws.String(profile),
-		}
-	} else {
-		providerAws.Log.Warnf("failed to get instance profile: %v", err)
-	}
-
-	subnetID, err := GetSubnet(ctx, providerAws)
-	if err != nil {
-		return Machine{}, fmt.Errorf("determine subnet ID: %w", err)
-	}
-	providerAws.Log.Debugf("using subnet: %s", subnetID)
-	instance.SubnetId = &subnetID
+	svc := ec2.NewFromConfig(cfg)
 
 	providerAws.Log.Debugf("launching EC2 instance")
 	result, err := svc.RunInstances(ctx, instance)
@@ -1054,25 +1051,215 @@ func Create(
 	}
 	providerAws.Log.Debugf("EC2 instance launched: %s", *result.Instances[0].InstanceId)
 
+	machine := NewMachineFromInstance(result.Instances[0])
+
 	if r53Zone.id != "" {
-		hostname := providerAws.Config.MachineID + "." + r53Zone.Name
-		providerAws.Log.Debugf(
-			"creating Route53 record: %s -> %s",
-			hostname,
-			*result.Instances[0].PrivateIpAddress,
+		resolvedIP, err := upsertRoute53ForInstance(
+			ctx,
+			providerAws,
+			r53Zone,
+			result.Instances[0],
 		)
-		if err := UpsertDevpodRoute53Record(ctx, providerAws, route53Record{
-			zoneID:   r53Zone.id,
-			hostname: hostname,
-			ip:       *result.Instances[0].PrivateIpAddress,
-		}); err != nil {
+		if err != nil {
+			terminateOnCleanup(providerAws, *result.Instances[0].InstanceId)
 			return Machine{}, fmt.Errorf("create Route53 record: %w", err)
 		}
+		machine.PublicIP = resolvedIP
 	}
 
-	machine := NewMachineFromInstance(result.Instances[0])
 	providerAws.Log.Debugf("instance %s created", machine.InstanceID)
 	return machine, nil
+}
+
+func buildRunInstancesInput(
+	ctx context.Context,
+	providerAws *AwsProvider,
+) (*ec2.RunInstancesInput, route53Zone, error) {
+	subnet, err := GetSubnet(ctx, providerAws)
+	if err != nil {
+		return nil, route53Zone{}, fmt.Errorf("determine subnet ID: %w", err)
+	}
+	devpodSG, err := resolveSecurityGroups(ctx, providerAws, subnet.vpcID)
+	if err != nil {
+		return nil, route53Zone{}, err
+	}
+	userData, err := GetInjectKeypairScript(providerAws.Config.MachineFolder)
+	if err != nil {
+		return nil, route53Zone{}, err
+	}
+	r53Zone, err := resolveRoute53Zone(ctx, providerAws)
+	if err != nil {
+		return nil, route53Zone{}, err
+	}
+	volSizeI32, err := validatedDiskSize(providerAws.Config.DiskSizeGB)
+	if err != nil {
+		return nil, route53Zone{}, err
+	}
+	cfg := providerAws.Config
+	instance := &ec2.RunInstancesInput{
+		ImageId:          aws.String(cfg.DiskImage),
+		InstanceType:     types.InstanceType(cfg.MachineType),
+		MinCount:         aws.Int32(1),
+		MaxCount:         aws.Int32(1),
+		SecurityGroupIds: devpodSG,
+		SubnetId:         aws.String(subnet.subnetID),
+		MetadataOptions: &types.InstanceMetadataOptionsRequest{
+			HttpEndpoint:            types.InstanceMetadataEndpointStateEnabled,
+			HttpTokens:              types.HttpTokensStateRequired,
+			HttpPutResponseHopLimit: aws.Int32(1),
+		},
+		BlockDeviceMappings: []types.BlockDeviceMapping{
+			{
+				DeviceName: aws.String(cfg.RootDevice),
+				Ebs: &types.EbsBlockDevice{
+					VolumeSize: &volSizeI32,
+				},
+			},
+		},
+		TagSpecifications: GetInstanceTags(providerAws, r53Zone),
+		UserData:          &userData,
+	}
+
+	applyNestedVirtualization(providerAws, instance)
+	applySpotInstance(providerAws, instance)
+
+	if err := applyInstanceProfile(ctx, providerAws, instance); err != nil {
+		return nil, route53Zone{}, err
+	}
+
+	return instance, r53Zone, nil
+}
+
+func resolveSecurityGroups(
+	ctx context.Context,
+	p *AwsProvider,
+	subnetVPC string,
+) ([]string, error) {
+	vpcID := subnetVPC
+	if vpcID == "" {
+		vpcID = p.Config.VpcID
+	}
+	return GetDevpodSecurityGroups(ctx, p, vpcID)
+}
+
+func resolveRoute53Zone(ctx context.Context, p *AwsProvider) (route53Zone, error) {
+	if !p.Config.UseRoute53Hostnames {
+		return route53Zone{}, nil
+	}
+	return GetDevpodRoute53Zone(ctx, p)
+}
+
+func validatedDiskSize(size int) (int32, error) {
+	if size < 0 || size > math.MaxInt32 {
+		return 0, fmt.Errorf("invalid disk size: %d", size)
+	}
+	return int32(size), nil //nolint:gosec // bounds checked above
+}
+
+func applyNestedVirtualization(providerAws *AwsProvider, instance *ec2.RunInstancesInput) {
+	if !providerAws.Config.UseNestedVirtualization {
+		return
+	}
+	providerAws.Log.Debugf("enabling nested virtualization")
+	instance.CpuOptions = &types.CpuOptionsRequest{
+		NestedVirtualization: types.NestedVirtualizationSpecificationEnabled,
+	}
+}
+
+func applySpotInstance(providerAws *AwsProvider, instance *ec2.RunInstancesInput) {
+	if !providerAws.Config.UseSpotInstance {
+		return
+	}
+	providerAws.Log.Debugf("using spot instance (type: %s)", providerAws.Config.SpotInstanceType)
+	spotOpts := &types.SpotMarketOptions{
+		SpotInstanceType: types.SpotInstanceType(providerAws.Config.SpotInstanceType),
+	}
+	if providerAws.Config.SpotInstanceType == "persistent" {
+		spotOpts.InstanceInterruptionBehavior = "stop"
+	}
+	instance.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
+		MarketType:  "spot",
+		SpotOptions: spotOpts,
+	}
+}
+
+func applyInstanceProfile(
+	ctx context.Context,
+	providerAws *AwsProvider,
+	instance *ec2.RunInstancesInput,
+) error {
+	providerAws.Log.Debugf("getting instance profile")
+	profile, err := GetDevpodInstanceProfile(ctx, providerAws)
+	if err != nil {
+		return fmt.Errorf("get instance profile: %w", err)
+	}
+	providerAws.Log.Debugf("using instance profile: %s", profile)
+	instance.IamInstanceProfile = &types.IamInstanceProfileSpecification{
+		Arn: aws.String(profile),
+	}
+	return nil
+}
+
+func upsertRoute53ForInstance(
+	ctx context.Context,
+	providerAws *AwsProvider,
+	zone route53Zone,
+	inst types.Instance,
+) (string, error) {
+	hostname := providerAws.Config.MachineID + "." + zone.Name
+	ip := *inst.PrivateIpAddress
+
+	if !zone.private {
+		svc := ec2.NewFromConfig(providerAws.AwsConfig)
+
+		publicIP, err := resolvePublicIP(ctx, providerAws, svc, inst)
+		if err != nil {
+			return "", err
+		}
+
+		ip = publicIP
+	}
+
+	providerAws.Log.Debugf("creating Route53 record: %s -> %s", hostname, ip)
+
+	if err := UpsertDevpodRoute53Record(ctx, providerAws, route53Record{
+		zoneID:   zone.id,
+		hostname: hostname,
+		ip:       ip,
+	}); err != nil {
+		return "", err
+	}
+
+	return ip, nil
+}
+
+func resolvePublicIP(
+	ctx context.Context,
+	providerAws *AwsProvider,
+	svc *ec2.Client,
+	inst types.Instance,
+) (string, error) {
+	if inst.PublicIpAddress != nil {
+		return *inst.PublicIpAddress, nil
+	}
+
+	instanceID := *inst.InstanceId
+	providerAws.Log.Debugf("waiting for public IP on instance %s", instanceID)
+
+	waiter := ec2.NewInstanceRunningWaiter(svc)
+
+	descOut, err := waiter.WaitForOutput(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 5*time.Minute)
+	if err != nil {
+		return "", fmt.Errorf("wait for instance running: %w", err)
+	}
+
+	if descOut.Reservations[0].Instances[0].PublicIpAddress == nil {
+		return "", fmt.Errorf("instance %s has no public IP for public Route53 zone", instanceID)
+	}
+
+	return *descOut.Reservations[0].Instances[0].PublicIpAddress, nil
 }
 
 func Start(ctx context.Context, provider *AwsProvider, instanceID string) error {
@@ -1166,6 +1353,19 @@ func Describe(ctx context.Context, provider *AwsProvider, name string) (string, 
 	return description, nil
 }
 
+func terminateOnCleanup(provider *AwsProvider, instanceID string) {
+	provider.Log.Debugf("terminating orphaned instance %s", instanceID)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+	svc := ec2.NewFromConfig(provider.AwsConfig)
+	_, err := svc.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		provider.Log.Warnf("failed to terminate orphaned instance %s: %v", instanceID, err)
+	}
+}
+
 func Delete(ctx context.Context, provider *AwsProvider, machine Machine) error {
 	provider.Log.Debugf("deleting instance %s", machine.InstanceID)
 
@@ -1252,7 +1452,7 @@ func logCallerIdentity(ctx context.Context, cfg aws.Config, logs log.Logger) err
 	return nil
 }
 
-// getCallerAccount returns the AWS account ID for logging context
+// getCallerAccount returns the AWS account ID for logging context.
 func getCallerAccount(ctx context.Context, cfg aws.Config) string {
 	svc := sts.NewFromConfig(cfg)
 	result, err := svc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
