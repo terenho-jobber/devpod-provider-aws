@@ -3,8 +3,14 @@ package options
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+)
+
+var (
+	devicePathRe = regexp.MustCompile(`^/dev/[a-zA-Z0-9/]+$`)
+	mountPathRe  = regexp.MustCompile(`^/[a-zA-Z0-9/_.-]+$`)
 )
 
 var (
@@ -32,6 +38,13 @@ var (
 	AWS_SECRET_ACCESS_KEY               = "AWS_SECRET_ACCESS_KEY"
 	AWS_SESSION_TOKEN                   = "AWS_SESSION_TOKEN"
 	CUSTOM_AWS_CREDENTIAL_COMMAND       = "CUSTOM_AWS_CREDENTIAL_COMMAND"
+
+	// Data volume options (all optional).
+	AWS_DATA_VOLUME_SNAPSHOT_ID = "AWS_DATA_VOLUME_SNAPSHOT_ID"
+	AWS_DATA_VOLUME_SIZE        = "AWS_DATA_VOLUME_SIZE"
+	AWS_DATA_VOLUME_DEVICE      = "AWS_DATA_VOLUME_DEVICE"
+	AWS_DATA_VOLUME_MOUNT_PATH  = "AWS_DATA_VOLUME_MOUNT_PATH"
+	AWS_DATA_VOLUME_TYPE        = "AWS_DATA_VOLUME_TYPE"
 )
 
 type Options struct {
@@ -61,6 +74,18 @@ type Options struct {
 	AccessKeyID                string
 	SecretAccessKey            string
 	SessionToken               string
+
+	// Optional secondary data volume
+	DataVolumeSnapshotID string
+	DataVolumeSizeGB     int
+	DataVolumeDevice     string
+	DataVolumeMountPath  string
+	DataVolumeType       string
+}
+
+// HasDataVolume reports whether a secondary data volume is configured.
+func (o *Options) HasDataVolume() bool {
+	return o.DataVolumeSnapshotID != "" || o.DataVolumeSizeGB > 0
 }
 
 var strTrue = "true"
@@ -114,6 +139,43 @@ func FromEnv(init, withFolder bool) (*Options, error) {
 	if subnetIDs != "" {
 		for _, subnetID := range strings.Split(subnetIDs, ",") {
 			retOptions.SubnetIDs = append(retOptions.SubnetIDs, strings.TrimSpace(subnetID))
+		}
+	}
+
+	// Optional data volume settings
+	retOptions.DataVolumeSnapshotID = os.Getenv(AWS_DATA_VOLUME_SNAPSHOT_ID)
+	retOptions.DataVolumeDevice = os.Getenv(AWS_DATA_VOLUME_DEVICE)
+	if retOptions.DataVolumeDevice == "" {
+		retOptions.DataVolumeDevice = "/dev/xvdf"
+	}
+	if !devicePathRe.MatchString(retOptions.DataVolumeDevice) {
+		return nil, fmt.Errorf(
+			"invalid %s: must be a valid device path like /dev/xvdf",
+			AWS_DATA_VOLUME_DEVICE,
+		)
+	}
+	retOptions.DataVolumeMountPath = os.Getenv(AWS_DATA_VOLUME_MOUNT_PATH)
+	if retOptions.DataVolumeMountPath == "" {
+		retOptions.DataVolumeMountPath = "/data"
+	}
+	if !mountPathRe.MatchString(retOptions.DataVolumeMountPath) {
+		return nil, fmt.Errorf(
+			"invalid %s: must be a valid absolute path like /data",
+			AWS_DATA_VOLUME_MOUNT_PATH,
+		)
+	}
+	retOptions.DataVolumeType = os.Getenv(AWS_DATA_VOLUME_TYPE)
+	if retOptions.DataVolumeType == "" {
+		retOptions.DataVolumeType = "gp3"
+	}
+	dataVolSize := os.Getenv(AWS_DATA_VOLUME_SIZE)
+	if dataVolSize != "" {
+		retOptions.DataVolumeSizeGB, err = strconv.Atoi(dataVolSize)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", AWS_DATA_VOLUME_SIZE, err)
+		}
+		if retOptions.DataVolumeSizeGB < 1 {
+			return nil, fmt.Errorf("invalid %s: must be at least 1", AWS_DATA_VOLUME_SIZE)
 		}
 	}
 

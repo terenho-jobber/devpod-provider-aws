@@ -1083,7 +1083,7 @@ func buildRunInstancesInput(
 	if err != nil {
 		return nil, route53Zone{}, err
 	}
-	userData, err := GetInjectKeypairScript(providerAws.Config.MachineFolder)
+	userData, err := GetInjectKeypairScript(providerAws.Config)
 	if err != nil {
 		return nil, route53Zone{}, err
 	}
@@ -1122,6 +1122,9 @@ func buildRunInstancesInput(
 
 	applyNestedVirtualization(providerAws, instance)
 	applySpotInstance(providerAws, instance)
+	if err := applyDataVolume(providerAws, instance); err != nil {
+		return nil, route53Zone{}, err
+	}
 
 	if err := applyInstanceProfile(ctx, providerAws, instance); err != nil {
 		return nil, route53Zone{}, err
@@ -1181,6 +1184,47 @@ func applySpotInstance(providerAws *AwsProvider, instance *ec2.RunInstancesInput
 		MarketType:  "spot",
 		SpotOptions: spotOpts,
 	}
+}
+
+// applyDataVolume adds an optional secondary EBS volume to the instance.
+// When a snapshot ID is provided, the volume is restored from that snapshot,
+// enabling fast workspace recovery without re-running lengthy setup steps.
+func applyDataVolume(
+	providerAws *AwsProvider,
+	instance *ec2.RunInstancesInput,
+) error {
+	cfg := providerAws.Config
+	if !cfg.HasDataVolume() {
+		return nil
+	}
+
+	mapping := types.BlockDeviceMapping{
+		DeviceName: aws.String(cfg.DataVolumeDevice),
+		Ebs: &types.EbsBlockDevice{
+			DeleteOnTermination: aws.Bool(true),
+			VolumeType:          types.VolumeType(cfg.DataVolumeType),
+		},
+	}
+
+	if cfg.DataVolumeSnapshotID != "" {
+		providerAws.Log.Debugf("attaching data volume from snapshot %s",
+			cfg.DataVolumeSnapshotID)
+		mapping.Ebs.SnapshotId = aws.String(cfg.DataVolumeSnapshotID)
+	}
+
+	if cfg.DataVolumeSizeGB > 0 {
+		size, err := validatedDiskSize(cfg.DataVolumeSizeGB)
+		if err != nil {
+			return fmt.Errorf("invalid data volume size: %w", err)
+		}
+		mapping.Ebs.VolumeSize = &size
+	}
+
+	instance.BlockDeviceMappings = append(instance.BlockDeviceMappings, mapping)
+	providerAws.Log.Debugf("data volume configured: device=%s mount=%s",
+		cfg.DataVolumeDevice, cfg.DataVolumeMountPath)
+
+	return nil
 }
 
 func applyInstanceProfile(
@@ -1409,8 +1453,8 @@ func Delete(ctx context.Context, provider *AwsProvider, machine Machine) error {
 	return nil
 }
 
-func GetInjectKeypairScript(dir string) (string, error) {
-	publicKeyBase, err := ssh.GetPublicKeyBase(dir)
+func GetInjectKeypairScript(config *options.Options) (string, error) {
+	publicKeyBase, err := ssh.GetPublicKeyBase(config.MachineFolder)
 	if err != nil {
 		return "", err
 	}
@@ -1435,7 +1479,75 @@ chmod 0700 /home/devpod/.ssh
 chmod 0600 /home/devpod/.ssh/authorized_keys
 chown -R devpod:devpod /home/devpod`
 
+	resultScript += dataVolumeMountScript(config)
+
 	return base64.StdEncoding.EncodeToString([]byte(resultScript)), nil
+}
+
+// dataVolumeMountScript returns a shell snippet that resolves the data volume
+// device (including NVMe translation on Nitro instances), formats it if needed,
+// and adds a persistent fstab entry.
+// See: https://docs.aws.amazon.com/ebs/latest/userguide/nvme-ebs-volumes.html
+// See: https://docs.aws.amazon.com/ebs/latest/userguide/identify-nvme-ebs-device.html
+func dataVolumeMountScript(config *options.Options) string {
+	if !config.HasDataVolume() {
+		return ""
+	}
+
+	return fmt.Sprintf(`
+
+# Mount secondary data volume. On Nitro instances, resolve NVMe device names.
+DATA_DEV="%[1]s"
+SNAPSHOT_ID="%[3]s"
+if [ ! -b "$DATA_DEV" ]; then
+  EXPECTED_SHORT=$(echo "%[1]s" | sed 's|^/dev/||')
+  for nvmedev in /dev/nvme[0-9]*n1; do
+    [ -b "$nvmedev" ] || continue
+    MAPPED=""
+    if command -v ebsnvme-id >/dev/null 2>&1; then
+      MAPPED=$(ebsnvme-id -b "$nvmedev" 2>/dev/null)
+    elif command -v nvme >/dev/null 2>&1; then
+      MAPPED=$(nvme id-ctrl -V "$nvmedev" 2>/dev/null \
+        | sed -n '/^vs\[\]/,$ { s/^.*"\(.*\)".*/\1/p }' \
+        | tr -d ' .' | head -1)
+    fi
+    MAPPED_SHORT=$(echo "$MAPPED" | sed 's|^/dev/||')
+    if [ "$MAPPED_SHORT" = "$EXPECTED_SHORT" ]; then
+      DATA_DEV="$nvmedev"
+      break
+    fi
+  done
+fi
+if [ ! -b "$DATA_DEV" ]; then
+  echo "ERROR: data volume device %[1]s not found" >&2; exit 1
+fi
+mkdir -p "%[2]s"
+if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
+  if [ -n "$SNAPSHOT_ID" ]; then
+    echo "ERROR: snapshot volume $DATA_DEV has no recognizable filesystem" >&2
+    exit 1
+  fi
+  mkfs.ext4 -q "$DATA_DEV"
+fi
+DATA_FSTYPE=$(blkid -s TYPE -o value "$DATA_DEV")
+if [ -z "$DATA_FSTYPE" ]; then
+  echo "ERROR: failed to detect filesystem type for $DATA_DEV" >&2
+  exit 1
+fi
+DATA_UUID=$(blkid -s UUID -o value "$DATA_DEV")
+if [ -z "$DATA_UUID" ]; then
+  echo "ERROR: failed to get UUID for data volume $DATA_DEV" >&2
+  exit 1
+fi
+if ! grep -q "UUID=$DATA_UUID" /etc/fstab; then
+  echo "UUID=$DATA_UUID %[2]s $DATA_FSTYPE defaults,nofail 0 2" >> /etc/fstab
+fi
+mount -a
+if ! mountpoint -q "%[2]s"; then
+  echo "ERROR: failed to mount data volume at %[2]s" >&2; exit 1
+fi
+case "$DATA_FSTYPE" in ext4) resize2fs "$DATA_DEV" 2>/dev/null;; xfs) xfs_growfs "%[2]s" 2>/dev/null;; esac
+chown devpod:devpod "%[2]s"`, config.DataVolumeDevice, config.DataVolumeMountPath, config.DataVolumeSnapshotID)
 }
 
 func logCallerIdentity(ctx context.Context, cfg aws.Config, logs log.Logger) error {
