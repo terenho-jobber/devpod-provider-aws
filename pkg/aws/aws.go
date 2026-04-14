@@ -1064,7 +1064,7 @@ func Create(
 	instance, r53Zone, err := buildRunInstancesInput(ctx, providerAws, subnet)
 	if err != nil {
 		if dataVolumeID != "" {
-			deleteVolume(cfg, dataVolumeID)
+			deleteVolume(cfg, dataVolumeID, providerAws.Log)
 		}
 		return Machine{}, err
 	}
@@ -1075,7 +1075,7 @@ func Create(
 	result, err := svc.RunInstances(ctx, instance)
 	if err != nil {
 		if dataVolumeID != "" {
-			deleteVolume(cfg, dataVolumeID)
+			deleteVolume(cfg, dataVolumeID, providerAws.Log)
 		}
 		return Machine{}, err
 	}
@@ -1084,9 +1084,17 @@ func Create(
 	instanceID := aws.ToString(result.Instances[0].InstanceId)
 
 	if dataVolumeID != "" {
+		waiter := ec2.NewInstanceRunningWaiter(svc)
+		if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: []string{instanceID},
+		}, 5*time.Minute); err != nil {
+			terminateOnCleanup(providerAws, instanceID)
+			deleteVolume(cfg, dataVolumeID, providerAws.Log)
+			return Machine{}, fmt.Errorf("wait for instance %s to be running: %w", instanceID, err)
+		}
 		if err := attachDataVolume(ctx, providerAws, instanceID, dataVolumeID); err != nil {
 			terminateOnCleanup(providerAws, instanceID)
-			deleteVolume(cfg, dataVolumeID)
+			deleteVolume(cfg, dataVolumeID, providerAws.Log)
 			return Machine{}, err
 		}
 	}
@@ -1103,7 +1111,7 @@ func Create(
 		if err != nil {
 			terminateOnCleanup(providerAws, instanceID)
 			if dataVolumeID != "" {
-				deleteVolume(cfg, dataVolumeID)
+				deleteVolume(cfg, dataVolumeID, providerAws.Log)
 			}
 			return Machine{}, fmt.Errorf("create Route53 record: %w", err)
 		}
@@ -1326,19 +1334,23 @@ func attachDataVolume(
 // cleanup succeeds even when the caller's context is cancelled. If the volume
 // is still in-use (e.g. instance is terminating), it waits for it to become
 // available before deleting.
-func deleteVolume(awsCfg aws.Config, volumeID string) {
+func deleteVolume(awsCfg aws.Config, volumeID string, logs log.Logger) {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	svc := ec2.NewFromConfig(awsCfg)
 
 	waiter := ec2.NewVolumeAvailableWaiter(svc)
-	_ = waiter.Wait(cleanupCtx, &ec2.DescribeVolumesInput{
+	if err := waiter.Wait(cleanupCtx, &ec2.DescribeVolumesInput{
 		VolumeIds: []string{volumeID},
-	}, 5*time.Minute)
+	}, 5*time.Minute); err != nil {
+		logs.Warnf("failed to wait for volume %s to become available: %v", volumeID, err)
+	}
 
-	_, _ = svc.DeleteVolume(cleanupCtx, &ec2.DeleteVolumeInput{
+	if _, err := svc.DeleteVolume(cleanupCtx, &ec2.DeleteVolumeInput{
 		VolumeId: aws.String(volumeID),
-	})
+	}); err != nil {
+		logs.Warnf("failed to delete volume %s: %v", volumeID, err)
+	}
 }
 
 func applyInstanceProfile(
@@ -1682,7 +1694,22 @@ if ! mountpoint -q "%[2]s"; then
   echo "ERROR: failed to mount data volume at %[2]s" >&2; exit 1
 fi
 case "$DATA_FSTYPE" in ext4) resize2fs "$DATA_DEV" 2>/dev/null;; xfs) xfs_growfs "%[2]s" 2>/dev/null;; esac
-chown devpod:devpod "%[2]s"`
+chown devpod:devpod "%[2]s"
+mkdir -p "%[2]s/.containerd-root" || { echo "ERROR: failed to create containerd root dir" >&2; exit 1; }
+mkdir -p /var/lib/containerd || { echo "ERROR: failed to create /var/lib/containerd" >&2; exit 1; }
+if ! mountpoint -q /var/lib/containerd; then
+  if ! mount --bind "%[2]s/.containerd-root" /var/lib/containerd; then
+    echo "ERROR: failed to bind-mount containerd root" >&2; exit 1
+  fi
+fi
+if ! grep -qF '%[2]s/.containerd-root /var/lib/containerd' /etc/fstab; then
+  FSTAB_ENTRY="%[2]s/.containerd-root /var/lib/containerd none bind 0 0"
+  echo "$FSTAB_ENTRY" >> /etc/fstab || { echo "ERROR: failed to update /etc/fstab" >&2; exit 1; }
+fi
+if [ -n "$SNAPSHOT_ID" ] && [ -d "%[2]s/containers" ]; then
+  rm -rf "%[2]s/containers"/* || true
+  rm -rf "%[2]s/network/files"/* || true
+fi`
 }
 
 func logCallerIdentity(ctx context.Context, cfg aws.Config, logs log.Logger) error {
